@@ -1,0 +1,10 @@
+[package]
+name = "toroxyproxy"
+version = "0.1.0"
+authors = ["D Keeler <mozkeeler@gmail.com>"]
+
+[dependencies]
+byteorder = "1.2.1"
+curl = "0.4.11"
+toroxide = { path = "../toroxide" }
+toroxide-openssl = { path = "../toroxide-openssl" }
