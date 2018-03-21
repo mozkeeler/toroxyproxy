@@ -8,7 +8,7 @@ use curl::Error;
 use curl::easy::Easy;
 use std::env;
 use std::io::{Read, Write};
-use std::net::{IpAddr, TcpListener};
+use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
 use std::thread::spawn;
 use std::time::Duration;
 use toroxide::{dir, types, Circuit, IdTracker};
@@ -46,22 +46,26 @@ fn do_proxy(peers: dir::TorPeerList, mut circ_id_tracker: IdTracker<u32>) {
         let version = reader.read_u8().unwrap();
         if version != 4 {
             println!("unexpected version field {}", version);
-            continue; // TODO: respond with correct socks error message?
+            stream.write_all(&[0, 0x5b]).unwrap(); // request rejected/failed code
+            continue;
         }
         let command = reader.read_u8().unwrap();
         if command != 1 {
             println!("unexpected command {}", command);
-            continue; // TODO same
+            stream.write_all(&[0, 0x5b]).unwrap(); // request rejected/failed code
+            continue;
         }
         let port = reader.read_u16::<NetworkEndian>().unwrap();
         let ip_addr = reader.read_u32::<NetworkEndian>().unwrap();
         if ip_addr > 255 {
             println!("unexpected invalid ip address {}", ip_addr);
+            stream.write_all(&[0, 0x5b]).unwrap(); // request rejected/failed code
             continue;
         }
         let null_terminator = reader.read_u8().unwrap();
         if null_terminator != 0 {
             println!("expected zero-length username");
+            stream.write_all(&[0, 0x5b]).unwrap(); // request rejected/failed code
             continue;
         }
         let mut str_buf: Vec<u8> = Vec::new();
@@ -138,6 +142,7 @@ fn do_proxy(peers: dir::TorPeerList, mut circ_id_tracker: IdTracker<u32>) {
 fn do_demo(peers: dir::TorPeerList, mut circ_id_tracker: IdTracker<u32>) {
     let mut circuit = setup_new_circuit(&peers, &mut circ_id_tracker).unwrap();
     let stream_id = circuit.begin("example.com:80").unwrap();
+    println!("beginning stream {}", stream_id);
     let request = r#"GET / HTTP/1.1
 Host: example.com
 User-Agent: toroxide/0.1.0
@@ -151,6 +156,7 @@ Connection: close
     print!("{}", String::from_utf8(response).unwrap());
 
     let stream_id = circuit.begin("ip.seeip.org:80").unwrap();
+    println!("beginning stream {}", stream_id);
     let request = r#"GET / HTTP/1.1
 Host: ip.seeip.org
 User-Agent: toroxide/0.1.0
@@ -208,15 +214,20 @@ pub fn get_tor_peers(hostport: &str) -> Result<dir::TorPeerList, ()> {
 pub fn setup_new_circuit(
     peers: &dir::TorPeerList,
     circ_id_tracker: &mut IdTracker<u32>,
-) -> Result<Circuit<TlsOpensslImpl, RsaVerifierOpensslImpl, RsaSignerOpensslImpl>, ()> {
+) -> Result<Circuit<TlsOpensslImpl<TcpStream>, RsaVerifierOpensslImpl, RsaSignerOpensslImpl>, ()> {
     let circ_id = circ_id_tracker.get_new_id();
     let guard_node = match peers.get_guard_node(&mut EasyFetcher {}) {
         Some(node) => node,
         None => return Err(()),
     };
-    let tls_impl =
-        TlsOpensslImpl::connect(IpAddr::V4(guard_node.get_ip_addr()), guard_node.get_port())
-            .unwrap();
+    let addrs = [
+        SocketAddr::new(IpAddr::V4(guard_node.get_ip_addr()), guard_node.get_port()),
+    ];
+    let stream = match TcpStream::connect(&addrs[..]) {
+        Ok(stream) => stream,
+        Err(_) => return Err(()),
+    };
+    let tls_impl = TlsOpensslImpl::connect(stream).unwrap();
     let rsa_verifier = RsaVerifierOpensslImpl {};
     let rsa_signer = RsaSignerOpensslImpl::new();
     let mut circuit = Circuit::new(tls_impl, rsa_verifier, rsa_signer, circ_id);
