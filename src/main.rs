@@ -205,39 +205,6 @@ pub fn get_tor_peers(hostport: &str) -> Result<dir::TorPeerList, ()> {
     Ok(dir::TorPeerList::new(hostport, &as_string))
 }
 
-// TODO: this needs to go back in toroxide somehow...
-/// Used while setting up a curcuit to fetch the directory information of the next hop.
-struct CircuitDirectoryFetcher<'a> {
-    circuit: &'a mut Circuit<TlsOpensslImpl, RsaVerifierOpensslImpl, RsaSignerOpensslImpl>,
-}
-
-impl<'a> dir::Fetch for CircuitDirectoryFetcher<'a> {
-    fn fetch(&mut self, uri: &str) -> Result<Vec<u8>, ()> {
-        let stream_id = self.circuit.begin_dir()?;
-        // uri will be of the form 'http://<host:port>/some/path/.../' - we just want the
-        // '/some/path/.../' part.
-        let path_parts = uri.split('/').skip(3);
-        let mut path = String::new();
-        for part in path_parts {
-            path.push('/');
-            path.push_str(part);
-        }
-        let request = format!("GET {} HTTP/1.0\r\n\r\n", path);
-        self.circuit.send(stream_id, request.as_bytes())?;
-        // This will be an HTTP response like "HTTP/1.0 200 OK..." - we just want the body.
-        let response = self.circuit.recv_to_end()?;
-        let as_string = match String::from_utf8(response) {
-            Ok(as_string) => as_string,
-            Err(_) => return Err(()),
-        };
-        let index = match as_string.find("\r\n\r\n") {
-            Some(index) => index,
-            None => return Err(()),
-        };
-        Ok(as_string[index + 4..].as_bytes().to_owned())
-    }
-}
-
 pub fn setup_new_circuit(
     peers: &dir::TorPeerList,
     circ_id_tracker: &mut IdTracker<u32>,
@@ -260,9 +227,7 @@ pub fn setup_new_circuit(
     circuit.read_netinfo()?;
     circuit.create_fast()?;
     let interior_node = {
-        let mut fetcher = CircuitDirectoryFetcher {
-            circuit: &mut circuit,
-        };
+        let mut fetcher = dir::CircuitDirectoryFetcher::new(&mut circuit);
         match peers.get_interior_node(&[&guard_node], &mut fetcher) {
             Some(node) => node,
             None => return Err(()),
@@ -270,9 +235,7 @@ pub fn setup_new_circuit(
     };
     circuit.extend(&interior_node)?;
     let exit_node = {
-        let mut fetcher = CircuitDirectoryFetcher {
-            circuit: &mut circuit,
-        };
+        let mut fetcher = dir::CircuitDirectoryFetcher::new(&mut circuit);
         match peers.get_exit_node(&[&guard_node, &interior_node], &mut fetcher) {
             Some(node) => node,
             None => return Err(()),
