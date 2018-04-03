@@ -6,5 +6,8 @@ authors = ["D Keeler <mozkeeler@gmail.com>"]
 [dependencies]
 byteorder = "1.2.1"
 curl = "0.4.11"
+futures = "0.1"
+tokio = "0.1"
+tokio-io = "0.1"
 toroxide = { path = "../toroxide" }
 toroxide-openssl = { path = "../toroxide-openssl" }
