@@ -43,21 +43,53 @@ fn main() {
         usage(&args[0]);
         return;
     }
+    let dir_server = &args[1];
 
-    doit(&args[1]).unwrap();
-
-    //let peers = get_tor_peers(&args[1]).unwrap();
-    //
-
-/*
     if args[2] == "demo" {
-        do_demo(peers, circ_id_tracker);
+        do_demo(dir_server);
 //    } else if args[2] == "proxy" {
 //        do_proxy(peers, circ_id_tracker);
     } else {
         panic!("unknown command '{}'", args[2]);
     }
-*/
+}
+
+fn do_demo(dir_server: &str) {
+    let mut core = Core::new().unwrap();
+    let peers = get_peer_list(&mut core, dir_server).unwrap();
+    let mut circ_id_tracker: IdTracker<u32> = IdTracker::new();
+    let circuit = create_circuit(&mut core, dir_server, &peers, &mut circ_id_tracker).unwrap();
+
+    let request = r#"GET / HTTP/1.1
+Host: example.com
+User-Agent: toroxide/0.1.0
+Accept: text/html
+Accept-Language: en-US,en;q=0.5
+Connection: close
+
+"#;
+    let future = CircuitDataFuture {
+        circuit: Some(circuit),
+        hostport: "example.com:80".to_owned(),
+        request: request.as_bytes().to_owned(),
+    }.and_then(|(circuit, response)| {
+        println!("{}", String::from_utf8(response).unwrap());
+        let request = r#"GET / HTTP/1.1
+Host: ip.seeip.org
+User-Agent: toroxide/0.1.0
+Connection: close
+
+"#;
+        CircuitDataFuture {
+            circuit: Some(circuit),
+            hostport: "ip.seeip.org:80".to_owned(),
+            request: request.as_bytes().to_owned(),
+        }
+    }).and_then(|(_, response)| {
+        println!("{}", String::from_utf8(response).unwrap());
+        Ok(())
+    });
+    core.run(future).unwrap();
 }
 
 struct TlsStreamFuture {
@@ -236,25 +268,35 @@ fn str_to_uri(uri: &str) -> io::Result<Uri> {
     uri.parse().map_err(|e| Error::new(ErrorKind::Other, e))
 }
 
-fn doit(hostport: &str) -> io::Result<()> {
-    let mut core = Core::new()?;
-    let uri = format!("http://{}/tor/status-vote/current/consensus-microdesc/", hostport);
+fn get_peer_list(core: &mut Core, dir_server: &str) -> io::Result<dir::TorPeerList> {
+    let uri = format!("http://{}/tor/status-vote/current/consensus-microdesc/", dir_server);
     let uri = str_to_uri(&uri)?;
     let handle = core.handle();
     let client = Client::new(&handle);
     let work = get(&client, uri).and_then(|chunk| {
-        let consensus = str::from_utf8(&chunk).unwrap();
-        let peers = dir::TorPeerList::new(&consensus);
-        let pre_guard_node = peers.get_guard_node().expect("couldn't get guard node?").clone();
-        let microdescriptor_uri = str_to_uri(&pre_guard_node.get_microdescriptor_uri(hostport)).unwrap();
-        let pre_interior_node = peers.get_interior_node(&[&pre_guard_node])
-            .expect("couldn't get interior node?").clone();
-        let pre_exit_node = peers.get_exit_node(&[&pre_guard_node, &pre_interior_node])
-            .expect("couldn't get exit node?").clone();
-        get(&client, microdescriptor_uri).and_then(|chunk| {
-            Ok((chunk, pre_guard_node, pre_interior_node, pre_exit_node))
-        })
-    }).and_then(|(chunk, pre_guard_node, pre_interior_node, pre_exit_node)| {
+        let consensus = str::from_utf8(&chunk).map_err(|e| Error::new(ErrorKind::Other, e))?;
+        Ok(dir::TorPeerList::new(&consensus))
+    });
+    core.run(work)
+}
+
+fn create_circuit(
+    core: &mut Core,
+    dir_server: &str,
+    peers: &dir::TorPeerList,
+    circ_id_tracker: &mut IdTracker<u32>,
+) -> io::Result<OpensslCircuit> {
+    let pre_guard_node = peers.get_guard_node().expect("couldn't get guard node?").clone();
+    let microdescriptor_uri = str_to_uri(&pre_guard_node.get_microdescriptor_uri(dir_server))?;
+    let pre_interior_node = peers.get_interior_node(&[&pre_guard_node])
+        .expect("couldn't get interior node?").clone();
+    let pre_exit_node = peers.get_exit_node(&[&pre_guard_node, &pre_interior_node])
+        .expect("couldn't get exit node?").clone();
+    let circ_id = circ_id_tracker.get_new_id();
+
+    let handle = core.handle();
+    let client = Client::new(&handle);
+    let work = get(&client, microdescriptor_uri).and_then(|chunk| {
         let microdescriptor = str::from_utf8(&chunk).unwrap();
         let guard_node = pre_guard_node.to_tor_peer(microdescriptor).unwrap();
         let addr = SocketAddr::new(IpAddr::V4(guard_node.get_ip_addr()), guard_node.get_port());
@@ -271,8 +313,6 @@ fn doit(hostport: &str) -> io::Result<()> {
         println!("I guess we're here?");
         let rsa_verifier = RsaVerifierOpensslImpl {};
         let rsa_signer = RsaSignerOpensslImpl::new();
-        let mut circ_id_tracker: IdTracker<u32> = IdTracker::new();
-        let circ_id = circ_id_tracker.get_new_id();
         let circuit = Circuit::new(tls_stream, rsa_verifier, &rsa_signer, circ_id,
                                    guard_node.get_ed25519_id_key());
         CircuitOpenFuture { circuit: Some(circuit) }.and_then(move |circuit| {
@@ -292,24 +332,8 @@ fn doit(hostport: &str) -> io::Result<()> {
             circuit: Some(circuit),
             node: exit_node.unwrap(),
         }
-    }).and_then(|circuit| {
-        let request = r#"GET / HTTP/1.1
-Host: example.com
-User-Agent: toroxide/0.1.0
-Accept: text/html
-Accept-Language: en-US,en;q=0.5
-Connection: close
-
-"#;
-        CircuitDataFuture {
-            circuit: Some(circuit),
-            hostport: "example.com:80".to_owned(),
-            request: request.as_bytes().to_owned(),
-        }
     });
-    let (circuit, response) = core.run(work)?;
-    println!("{}", String::from_utf8(response).unwrap());
-    Ok(())
+    core.run(work)
 }
 
 /*
@@ -477,114 +501,5 @@ fn process(socket: TcpStream) {
         })
         .then(|_| Ok(()));
     tokio::spawn(socks4_connection);
-}
-*/
-
-/*
-fn do_demo(peers: dir::TorPeerList, mut circ_id_tracker: IdTracker<u32>) {
-    let mut circuit = setup_new_circuit(&peers, &mut circ_id_tracker).unwrap();
-    loop {
-        let result = match circuit.poll() {
-            Ok(result) => result,
-            Err(e) => {
-                println!("error polling circuit: {}", e);
-                return;
-            }
-        };
-        println!("{:?}", result);
-        thread::sleep(Duration::from_millis(100));
-        match result {
-            toroxide::Async::Ready(_) => break,
-            toroxide::Async::NotReady => continue,
-        }
-    }
-    */
-    /*
-    let stream_id = circuit.begin("example.com:80").unwrap();
-    println!("beginning stream {}", stream_id);
-    let request = r#"GET / HTTP/1.1
-Host: example.com
-User-Agent: toroxide/0.1.0
-Accept: text/html
-Accept-Language: en-US,en;q=0.5
-Connection: close
-
-"#;
-    circuit.send(stream_id, request.as_bytes()).unwrap();
-    let response = circuit.recv_to_end().unwrap();
-    print!("{}", String::from_utf8(response).unwrap());
-
-    let stream_id = circuit.begin("ip.seeip.org:80").unwrap();
-    println!("beginning stream {}", stream_id);
-    let request = r#"GET / HTTP/1.1
-Host: ip.seeip.org
-User-Agent: toroxide/0.1.0
-Connection: close
-
-"#;
-    circuit.send(stream_id, request.as_bytes()).unwrap();
-    let response = circuit.recv_to_end().unwrap();
-    print!("{}", String::from_utf8(response).unwrap());
-    */
-/*
-}
-*/
-
-/*
-pub fn setup_new_circuit(
-    peers: &dir::TorPeerList,
-    circ_id_tracker: &mut IdTracker<u32>,
-) -> Result<Circuit<TlsOpensslImpl<TcpStream>, RsaVerifierOpensslImpl>, ()> {
-    let circ_id = circ_id_tracker.get_new_id();
-    let guard_node = match peers.get_guard_node(&mut EasyFetcher {}) {
-        Some(node) => node,
-        None => return Err(()),
-    };
-    let addr = SocketAddr::new(IpAddr::V4(guard_node.get_ip_addr()), guard_node.get_port());
-    let stream = match TcpStream::connect(&addr) {
-        Ok(stream) => stream,
-        Err(_) => return Err(()),
-    };
-    match stream.set_nonblocking(true) {
-        Ok(_) => {},
-        Err(_) => return Err(()),
-    }
-    let mut pending_tls_impl = PendingTlsOpensslImpl::new(stream).unwrap();
-    let mut tls_impl_option = None;
-    loop {
-        match pending_tls_impl.poll().unwrap() {
-            toroxide::Async::Ready(tls_impl) => {
-                tls_impl_option = Some(tls_impl);
-                break;
-            }
-            toroxide::Async::NotReady => continue,
-        }
-        thread::sleep(Duration::from_millis(100));
-    }
-    let rsa_verifier = RsaVerifierOpensslImpl {};
-    let rsa_signer = RsaSignerOpensslImpl::new();
-    let circuit = Circuit::new(tls_impl_option.unwrap(), rsa_verifier, &rsa_signer, circ_id,
-                               guard_node.get_ed25519_id_key());
-    */
-    /*
-    let interior_node = {
-        let mut fetcher = dir::CircuitDirectoryFetcher::new(&mut circuit);
-        match peers.get_interior_node(&[&guard_node], &mut fetcher) {
-            Some(node) => node,
-            None => return Err(()),
-        }
-    };
-    circuit.extend(&interior_node)?;
-    let exit_node = {
-        let mut fetcher = dir::CircuitDirectoryFetcher::new(&mut circuit);
-        match peers.get_exit_node(&[&guard_node, &interior_node], &mut fetcher) {
-            Some(node) => node,
-            None => return Err(()),
-        }
-    };
-    circuit.extend(&exit_node)?;
-    */
-    /*
-    Ok(circuit)
 }
 */
