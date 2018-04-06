@@ -301,15 +301,15 @@ fn create_circuit(
         let guard_node = pre_guard_node.to_tor_peer(microdescriptor).unwrap();
         let addr = SocketAddr::new(IpAddr::V4(guard_node.get_ip_addr()), guard_node.get_port());
          TcpStream::connect(&addr).and_then(|stream| {
-             Ok((stream, guard_node, pre_interior_node, pre_exit_node))
+             Ok((stream, guard_node))
          })
-    }).and_then(|(stream, guard_node, pre_interior_node, pre_exit_node)| {
+    }).and_then(|(stream, guard_node)| {
         // TODO: how do we handle errors inside these things?
         let pending_tls_stream = PendingTlsOpensslImpl::new(stream).unwrap();
         (TlsStreamFuture { pending_tls_stream }).and_then(|tls_stream| {
-            Ok((tls_stream, guard_node, pre_interior_node, pre_exit_node))
+            Ok((tls_stream, guard_node))
         })
-    }).and_then(|(tls_stream, guard_node, pre_interior_node, pre_exit_node)| {
+    }).and_then(|(tls_stream, guard_node)| {
         println!("I guess we're here?");
         let rsa_verifier = RsaVerifierOpensslImpl {};
         let rsa_signer = RsaSignerOpensslImpl::new();
@@ -318,9 +318,9 @@ fn create_circuit(
         CircuitOpenFuture { circuit: Some(circuit) }.and_then(move |circuit| {
             CircuitDirFuture::new(circuit, pre_interior_node)
         }).and_then(|(circuit, interior_node)| {
-            Ok((circuit, interior_node, pre_exit_node))
+            Ok((circuit, interior_node))
         })
-    }).and_then(|(circuit, interior_node, pre_exit_node)| {
+    }).and_then(|(circuit, interior_node)| {
         (CircuitExtendFuture {
             circuit: Some(circuit),
             node: interior_node.unwrap(),
