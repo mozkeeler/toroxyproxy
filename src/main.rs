@@ -160,10 +160,63 @@ impl Future for CircuitDirFuture {
                         Some(index) => index,
                         None => return Ok(Async::Ready((circuit, Err(())))),
                     };
-                    let slice = &as_string[index + 4..];
                     let result = self.pre_node.to_tor_peer(&as_string[index + 4..]);
                     return Ok(Async::Ready((circuit, result)));
                 }
+                toroxide::Async::NotReady => {},
+            }
+        }
+    }
+}
+
+struct CircuitExtendFuture {
+    circuit: Option<OpensslCircuit>,
+    node: toroxide::dir::TorPeer,
+}
+
+impl Future for CircuitExtendFuture {
+    type Item = OpensslCircuit;
+    type Error = io::Error;
+
+    fn poll(&mut self) -> Result<Async<OpensslCircuit>, io::Error> {
+        let mut circuit = match self.circuit.take() {
+            Some(circuit) => circuit,
+            None => {
+                println!("poll called with None circuit?");
+                return Err(Error::new(ErrorKind::Other, "circuit should be Some here"));
+            }
+        };
+        loop {
+            match circuit.poll_extend(&self.node)? {
+                toroxide::Async::Ready(()) => return Ok(Async::Ready(circuit)),
+                toroxide::Async::NotReady => {},
+            }
+        }
+    }
+}
+
+struct CircuitDataFuture {
+    circuit: Option<OpensslCircuit>,
+    hostport: String,
+    request: Vec<u8>,
+}
+
+impl Future for CircuitDataFuture {
+    type Item = (OpensslCircuit, Vec<u8>);
+    type Error = io::Error;
+
+    fn poll(&mut self) -> Result<Async<(OpensslCircuit, Vec<u8>)>, io::Error> {
+        let mut circuit = match self.circuit.take() {
+            Some(circuit) => circuit,
+            None => {
+                println!("poll called with None circuit?");
+                return Err(Error::new(ErrorKind::Other, "circuit should be Some here"));
+            }
+        };
+        let stream_id = circuit.open_stream();
+        loop {
+            match circuit.poll_stream(stream_id, &self.hostport, &self.request)? {
+                toroxide::Async::Ready(response) => return Ok(Async::Ready((circuit, response))),
                 toroxide::Async::NotReady => {},
             }
         }
@@ -196,24 +249,25 @@ fn doit(hostport: &str) -> io::Result<()> {
         let microdescriptor_uri = str_to_uri(&pre_guard_node.get_microdescriptor_uri(hostport)).unwrap();
         let pre_interior_node = peers.get_interior_node(&[&pre_guard_node])
             .expect("couldn't get interior node?").clone();
-        //let pre_exit_node = peers.get_exit_node().expect("couldn't get exit node?").clone();
+        let pre_exit_node = peers.get_exit_node(&[&pre_guard_node, &pre_interior_node])
+            .expect("couldn't get exit node?").clone();
         get(&client, microdescriptor_uri).and_then(|chunk| {
-            Ok((chunk, pre_guard_node, pre_interior_node))
+            Ok((chunk, pre_guard_node, pre_interior_node, pre_exit_node))
         })
-    }).and_then(|(chunk, pre_guard_node, pre_interior_node)| {
+    }).and_then(|(chunk, pre_guard_node, pre_interior_node, pre_exit_node)| {
         let microdescriptor = str::from_utf8(&chunk).unwrap();
         let guard_node = pre_guard_node.to_tor_peer(microdescriptor).unwrap();
         let addr = SocketAddr::new(IpAddr::V4(guard_node.get_ip_addr()), guard_node.get_port());
          TcpStream::connect(&addr).and_then(|stream| {
-             Ok((stream, guard_node, pre_interior_node))
+             Ok((stream, guard_node, pre_interior_node, pre_exit_node))
          })
-    }).and_then(|(stream, guard_node, pre_interior_node)| {
+    }).and_then(|(stream, guard_node, pre_interior_node, pre_exit_node)| {
         // TODO: how do we handle errors inside these things?
         let pending_tls_stream = PendingTlsOpensslImpl::new(stream).unwrap();
         (TlsStreamFuture { pending_tls_stream }).and_then(|tls_stream| {
-            Ok((tls_stream, guard_node, pre_interior_node))
+            Ok((tls_stream, guard_node, pre_interior_node, pre_exit_node))
         })
-    }).and_then(|(tls_stream, guard_node, pre_interior_node)| {
+    }).and_then(|(tls_stream, guard_node, pre_interior_node, pre_exit_node)| {
         println!("I guess we're here?");
         let rsa_verifier = RsaVerifierOpensslImpl {};
         let rsa_signer = RsaSignerOpensslImpl::new();
@@ -223,10 +277,38 @@ fn doit(hostport: &str) -> io::Result<()> {
                                    guard_node.get_ed25519_id_key());
         CircuitOpenFuture { circuit: Some(circuit) }.and_then(move |circuit| {
             CircuitDirFuture::new(circuit, pre_interior_node)
+        }).and_then(|(circuit, interior_node)| {
+            Ok((circuit, interior_node, pre_exit_node))
         })
+    }).and_then(|(circuit, interior_node, pre_exit_node)| {
+        (CircuitExtendFuture {
+            circuit: Some(circuit),
+            node: interior_node.unwrap(),
+        }).and_then(|circuit| {
+            CircuitDirFuture::new(circuit, pre_exit_node)
+        })
+    }).and_then(|(circuit, exit_node)| {
+        CircuitExtendFuture {
+            circuit: Some(circuit),
+            node: exit_node.unwrap(),
+        }
+    }).and_then(|circuit| {
+        let request = r#"GET / HTTP/1.1
+Host: example.com
+User-Agent: toroxide/0.1.0
+Accept: text/html
+Accept-Language: en-US,en;q=0.5
+Connection: close
+
+"#;
+        CircuitDataFuture {
+            circuit: Some(circuit),
+            hostport: "example.com:80".to_owned(),
+            request: request.as_bytes().to_owned(),
+        }
     });
-    let (circuit, interior_peer) = core.run(work)?;
-    println!("{:?}", interior_peer);
+    let (circuit, response) = core.run(work)?;
+    println!("{}", String::from_utf8(response).unwrap());
     Ok(())
 }
 
