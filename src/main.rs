@@ -68,23 +68,18 @@ Accept-Language: en-US,en;q=0.5
 Connection: close
 
 "#;
-    let future = CircuitDataFuture {
-        circuit: Some(circuit),
-        hostport: "example.com:80".to_owned(),
-        request: request.as_bytes().to_owned(),
-    }.and_then(|(circuit, response)| {
-        println!("{}", String::from_utf8(response).unwrap());
-        let request = r#"GET / HTTP/1.1
+    let hostport = "example.com:80";
+    let future = CircuitDataFuture::new(circuit, hostport, request.as_bytes())
+        .and_then(|(circuit, response)| {
+            println!("{}", String::from_utf8(response).unwrap());
+            let request = r#"GET / HTTP/1.1
 Host: ip.seeip.org
 User-Agent: toroxide/0.1.0
 Connection: close
 
 "#;
-        CircuitDataFuture {
-            circuit: Some(circuit),
-            hostport: "ip.seeip.org:80".to_owned(),
-            request: request.as_bytes().to_owned(),
-        }
+            let hostport = "ip.seeip.org:80";
+            CircuitDataFuture::new(circuit, hostport, request.as_bytes())
     }).and_then(|(_, response)| {
         println!("{}", String::from_utf8(response).unwrap());
         Ok(())
@@ -147,10 +142,18 @@ impl Future for CircuitOpenFuture {
     }
 }
 
+enum CircuitDirFutureState {
+    Setup,
+    RequestWriting,
+    ResponseReading,
+}
+
 struct CircuitDirFuture {
     circuit: Option<OpensslCircuit>,
     pre_node: toroxide::dir::PreTorPeer,
     request: Vec<u8>,
+    response: Vec<u8>,
+    state: CircuitDirFutureState,
 }
 
 impl CircuitDirFuture {
@@ -162,6 +165,8 @@ impl CircuitDirFuture {
             circuit: Some(circuit),
             pre_node,
             request: request.as_bytes().to_owned(),
+            response: Vec::new(),
+            state: CircuitDirFutureState::Setup,
         }
     }
 }
@@ -182,20 +187,42 @@ impl Future for CircuitDirFuture {
         };
         let stream_id = circuit.open_dir_stream();
         loop {
-            match circuit.poll_dir(stream_id, &self.request)? {
-                toroxide::Async::Ready(response) => {
-                    let as_string = match String::from_utf8(response) {
-                        Ok(as_string) => as_string,
-                        Err(_) => return Ok(Async::Ready((circuit, Err(())))),
-                    };
-                    let index = match as_string.find("\r\n\r\n") {
-                        Some(index) => index,
-                        None => return Ok(Async::Ready((circuit, Err(())))),
-                    };
-                    let result = self.pre_node.to_tor_peer(&as_string[index + 4..]);
-                    return Ok(Async::Ready((circuit, result)));
+            match self.state {
+                CircuitDirFutureState::Setup => {
+                    match circuit.poll_stream_setup(stream_id)? {
+                        toroxide::Async::Ready(()) => self.state = CircuitDirFutureState::RequestWriting,
+                        toroxide::Async::NotReady => continue,
+                    }
                 }
-                toroxide::Async::NotReady => {},
+                CircuitDirFutureState::RequestWriting => {
+                    match circuit.poll_stream_write(stream_id, &self.request)? {
+                        toroxide::Async::Ready(()) => self.state = CircuitDirFutureState::ResponseReading,
+                        toroxide::Async::NotReady => continue,
+                    }
+                }
+                CircuitDirFutureState::ResponseReading => {
+                    match circuit.poll_stream_read(stream_id)? {
+                        toroxide::Async::Ready(mut response) => {
+                            // We've reached the end of what we're being sent if we get a
+                            // zero-length response (although right now toroxide doesn't enforce
+                            // that peers don't send us zero-length DATA cells...)
+                            if response.len() == 0 {
+                                let as_string = match str::from_utf8(&self.response) {
+                                    Ok(as_string) => as_string,
+                                    Err(_) => return Ok(Async::Ready((circuit, Err(())))),
+                                };
+                                let index = match as_string.find("\r\n\r\n") {
+                                    Some(index) => index,
+                                    None => return Ok(Async::Ready((circuit, Err(())))),
+                                };
+                                let result = self.pre_node.to_tor_peer(&as_string[index + 4..]);
+                                return Ok(Async::Ready((circuit, result)));
+                            }
+                            self.response.append(&mut response);
+                        }
+                        toroxide::Async::NotReady => {},
+                    }
+                }
             }
         }
     }
@@ -227,10 +254,30 @@ impl Future for CircuitExtendFuture {
     }
 }
 
+enum CircuitDataFutureState {
+    Setup,
+    Writing,
+    Reading,
+}
+
 struct CircuitDataFuture {
     circuit: Option<OpensslCircuit>,
     hostport: String,
     request: Vec<u8>,
+    response: Vec<u8>,
+    state: CircuitDataFutureState,
+}
+
+impl CircuitDataFuture {
+    fn new(circuit: OpensslCircuit, hostport: &str, request: &[u8]) -> CircuitDataFuture {
+        CircuitDataFuture {
+            circuit: Some(circuit),
+            hostport: hostport.to_owned(),
+            request: request.to_owned(),
+            response: Vec::new(),
+            state: CircuitDataFutureState::Setup,
+        }
+    }
 }
 
 impl Future for CircuitDataFuture {
@@ -245,11 +292,32 @@ impl Future for CircuitDataFuture {
                 return Err(Error::new(ErrorKind::Other, "circuit should be Some here"));
             }
         };
-        let stream_id = circuit.open_stream();
+        let stream_id = circuit.open_stream(&self.hostport);
         loop {
-            match circuit.poll_stream(stream_id, &self.hostport, &self.request)? {
-                toroxide::Async::Ready(response) => return Ok(Async::Ready((circuit, response))),
-                toroxide::Async::NotReady => {},
+            match self.state {
+                CircuitDataFutureState::Setup => {
+                    match circuit.poll_stream_setup(stream_id)? {
+                        toroxide::Async::Ready(()) => self.state = CircuitDataFutureState::Writing,
+                        toroxide::Async::NotReady => continue,
+                    }
+                }
+                CircuitDataFutureState::Writing => {
+                    match circuit.poll_stream_write(stream_id, &self.request)? {
+                        toroxide::Async::Ready(()) => self.state = CircuitDataFutureState::Reading,
+                        toroxide::Async::NotReady => continue,
+                    }
+                }
+                CircuitDataFutureState::Reading => {
+                    match circuit.poll_stream_read(stream_id)? {
+                        toroxide::Async::Ready(mut response) => {
+                            if response.len() == 0 {
+                                return Ok(Async::Ready((circuit, self.response.clone())));
+                            }
+                            self.response.append(&mut response);
+                        }
+                        toroxide::Async::NotReady => {},
+                    }
+                }
             }
         }
     }
