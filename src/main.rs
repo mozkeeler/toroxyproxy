@@ -1,37 +1,21 @@
-extern crate futures;
-extern crate hyper;
+extern crate byteorder;
 extern crate tokio;
-extern crate tokio_core;
+extern crate tokio_io;
 extern crate toroxide;
 extern crate toroxide_openssl;
-/*
-extern crate byteorder;
-extern crate tokio_io;
-*/
 
-use futures::{Async, Future, IntoFuture, Stream};
-use hyper::{Body, Chunk, Client, Uri};
-use hyper::client::HttpConnector;
-use std::io::{self, Error, ErrorKind, Write};
+use byteorder::{NetworkEndian, ReadBytesExt, WriteBytesExt};
+use std::io::{self, Error, ErrorKind, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::{env, str};
+use std::env;
+use std::str::{self, FromStr};
+use tokio::io::{read_to_end, write_all};
 use tokio::net::{TcpListener, TcpStream};
-use tokio_core::reactor::{Core, Handle};
+use tokio::prelude::{Async, Future};
+use tokio_io::AsyncRead;
 use toroxide::{dir, Circuit, IdTracker};
 use toroxide_openssl::{PendingTlsOpensslImpl, RsaSignerOpensslImpl, RsaVerifierOpensslImpl,
                        TlsOpensslImpl};
-
-/*
-use byteorder::{NetworkEndian, ReadBytesExt, WriteBytesExt};
-use std::convert::From;
-use std::io::{Read, Write, Error, ErrorKind};
-use std::net::TcpStream;
-use std::thread::{self, spawn};
-use std::time::Duration;
-use tokio::io;
-use tokio::prelude::*;
-use tokio_io::io::{ReadHalf, WriteHalf};
-*/
 
 fn usage(program: &str) {
     println!("Usage: {} <directory server>:<port> <demo|proxy>", program);
@@ -46,21 +30,19 @@ fn main() {
     let dir_server = &args[1];
 
     if args[2] == "demo" {
-        do_demo(dir_server);
-//    } else if args[2] == "proxy" {
-//        do_proxy(peers, circ_id_tracker);
+        do_demo(dir_server).unwrap();
+    //} else if args[2] == "proxy" {
+    //    do_proxy(dir_server).unwrap();
     } else {
         panic!("unknown command '{}'", args[2]);
     }
 }
 
-fn do_demo(dir_server: &str) {
-    let mut core = Core::new().unwrap();
-    let peers = get_peer_list(&mut core, dir_server).unwrap();
+fn do_demo(dir_server: &str) -> Result<(), io::Error> {
+    let peers = get_peer_list(dir_server)?;
     let mut circ_id_tracker: IdTracker<u32> = IdTracker::new();
-    let circuit = create_circuit(&mut core, dir_server, &peers, &mut circ_id_tracker).unwrap();
-
-    let request = r#"GET / HTTP/1.1
+    let task = create_circuit(dir_server, &peers, &mut circ_id_tracker).and_then(|circuit| {
+        let request = r#"GET / HTTP/1.1
 Host: example.com
 User-Agent: toroxide/0.1.0
 Accept: text/html
@@ -68,23 +50,24 @@ Accept-Language: en-US,en;q=0.5
 Connection: close
 
 "#;
-    let hostport = "example.com:80";
-    let future = CircuitDataFuture::new(circuit, hostport, request.as_bytes())
-        .and_then(|(circuit, response)| {
-            println!("{}", String::from_utf8(response).unwrap());
-            let request = r#"GET / HTTP/1.1
+        let hostport = "example.com:80";
+        CircuitDataFuture::new(circuit, hostport, request.as_bytes())
+    }).and_then(|(circuit, response)| {
+        println!("{}", String::from_utf8(response).unwrap());
+        let request = r#"GET / HTTP/1.1
 Host: ip.seeip.org
 User-Agent: toroxide/0.1.0
 Connection: close
 
 "#;
-            let hostport = "ip.seeip.org:80";
-            CircuitDataFuture::new(circuit, hostport, request.as_bytes())
+        let hostport = "ip.seeip.org:80";
+        CircuitDataFuture::new(circuit, hostport, request.as_bytes())
     }).and_then(|(_, response)| {
         println!("{}", String::from_utf8(response).unwrap());
         Ok(())
-    });
-    core.run(future).unwrap();
+    }).then(|_| Ok(()));
+    tokio::run(task);
+    Ok(())
 }
 
 struct TlsStreamFuture {
@@ -176,7 +159,7 @@ impl Future for CircuitDirFuture {
     type Error = io::Error;
 
     fn poll(
-        &mut self
+        &mut self,
     ) -> Result<Async<(OpensslCircuit, Result<toroxide::dir::TorPeer, ()>)>, io::Error> {
         let mut circuit = match self.circuit.take() {
             Some(circuit) => circuit,
@@ -323,61 +306,71 @@ impl Future for CircuitDataFuture {
     }
 }
 
-fn get(
-    client: &Client<HttpConnector, Body>,
-    uri: Uri
-) -> Box<Future<Item = Chunk, Error = io::Error>> {
-    Box::new(client.get(uri).and_then(|res| {
-        res.body().concat2()
-    }).map_err(|e| Error::new(ErrorKind::Other, e)))
+// Synchronously fetches the peer list from the directory server.
+fn get_peer_list(dir_server: &str) -> io::Result<dir::TorPeerList> {
+    let mut stream = std::net::TcpStream::connect(dir_server)?;
+    let request = "GET /tor/status-vote/current/consensus-microdesc/ HTTP/1.0\r\n\r\n";
+    stream.write_all(request.as_bytes())?;
+    let mut buf = String::new();
+    stream.read_to_string(&mut buf)?;
+    let index = match buf.find("\r\n\r\n") {
+        Some(index) => index,
+        None => return Err(Error::new(ErrorKind::Other, "bad response from directory server")),
+    };
+    println!("returning '{}'", &buf[index + 4..]);
+    Ok(dir::TorPeerList::new(&buf[index + 4..]))
 }
 
-fn str_to_uri(uri: &str) -> io::Result<Uri> {
-    uri.parse().map_err(|e| Error::new(ErrorKind::Other, e))
-}
-
-fn get_peer_list(core: &mut Core, dir_server: &str) -> io::Result<dir::TorPeerList> {
-    let uri = format!("http://{}/tor/status-vote/current/consensus-microdesc/", dir_server);
-    let uri = str_to_uri(&uri)?;
-    let handle = core.handle();
-    let client = Client::new(&handle);
-    let work = get(&client, uri).and_then(|chunk| {
-        let consensus = str::from_utf8(&chunk).map_err(|e| Error::new(ErrorKind::Other, e))?;
-        Ok(dir::TorPeerList::new(&consensus))
-    });
-    core.run(work)
+fn async_get_microdescriptor(
+    dir_server: &str,
+    microdescriptor_path: String,
+) -> Box<Future<Item = String, Error = tokio::io::Error> + Send> {
+    // TODO: tokio doesn't re-export future::err?
+    // TODO: support domain names as well
+    let socket_addr = dir_server.parse().unwrap();
+    Box::new(TcpStream::connect(&socket_addr).and_then(move |stream| {
+        let request = format!("GET {} HTTP/1.0\r\n\r\n", microdescriptor_path);
+        write_all(stream, request.clone())
+    }).and_then(|(stream, _)| {
+        let buf = Vec::new();
+        read_to_end(stream, buf)
+    }).and_then(|(_, buf)| {
+        let as_string = String::from_utf8(buf).map_err(|e| Error::new(ErrorKind::Other, e))?;
+        let index = match as_string.find("\r\n\r\n") {
+            Some(index) => index,
+            None => return Err(Error::new(ErrorKind::Other, "bad response from directory server")),
+        };
+        Ok(as_string[index + 4..].to_owned())
+    }))
 }
 
 fn create_circuit(
-    core: &mut Core,
     dir_server: &str,
     peers: &dir::TorPeerList,
     circ_id_tracker: &mut IdTracker<u32>,
-) -> io::Result<OpensslCircuit> {
+) -> Box<Future<Item = OpensslCircuit, Error = io::Error> + Send> {
     let pre_guard_node = peers.get_guard_node().expect("couldn't get guard node?").clone();
-    let microdescriptor_uri = str_to_uri(&pre_guard_node.get_microdescriptor_uri(dir_server))?;
+    let microdescriptor_path = pre_guard_node.get_microdescriptor_path();
     let pre_interior_node = peers.get_interior_node(&[&pre_guard_node])
         .expect("couldn't get interior node?").clone();
     let pre_exit_node = peers.get_exit_node(&[&pre_guard_node, &pre_interior_node])
         .expect("couldn't get exit node?").clone();
     let circ_id = circ_id_tracker.get_new_id();
 
-    let handle = core.handle();
-    let client = Client::new(&handle);
-    let work = get(&client, microdescriptor_uri).and_then(|chunk| {
-        let microdescriptor = str::from_utf8(&chunk).unwrap();
-        let guard_node = pre_guard_node.to_tor_peer(microdescriptor).unwrap();
-        let addr = SocketAddr::new(IpAddr::V4(guard_node.get_ip_addr()), guard_node.get_port());
-         TcpStream::connect(&addr).and_then(|stream| {
-             Ok((stream, guard_node))
-         })
+    Box::new(async_get_microdescriptor(dir_server, microdescriptor_path)
+        .and_then(move |microdescriptor| {
+            let guard_node = pre_guard_node.to_tor_peer(&microdescriptor).unwrap();
+            let addr = SocketAddr::new(IpAddr::V4(guard_node.get_ip_addr()), guard_node.get_port());
+             TcpStream::connect(&addr).and_then(|stream| {
+                 Ok((stream, guard_node))
+             })
     }).and_then(|(stream, guard_node)| {
         // TODO: how do we handle errors inside these things?
         let pending_tls_stream = PendingTlsOpensslImpl::new(stream).unwrap();
         (TlsStreamFuture { pending_tls_stream }).and_then(|tls_stream| {
             Ok((tls_stream, guard_node))
         })
-    }).and_then(|(tls_stream, guard_node)| {
+    }).and_then(move |(tls_stream, guard_node)| {
         println!("I guess we're here?");
         let rsa_verifier = RsaVerifierOpensslImpl {};
         let rsa_signer = RsaSignerOpensslImpl::new();
@@ -400,8 +393,7 @@ fn create_circuit(
             circuit: Some(circuit),
             node: exit_node.unwrap(),
         }
-    });
-    core.run(work)
+    }))
 }
 
 /*
@@ -483,11 +475,16 @@ impl Future for Pipe {
 */
 
 /*
-fn do_proxy(peers: dir::TorPeerList, mut circ_id_tracker: IdTracker<u32>) {
+fn do_proxy(dir_server: &str) {
+    let mut core = Core::new().unwrap();
+    let peers = get_peer_list(&mut core, dir_server).unwrap();
+    let mut circ_id_tracker: IdTracker<u32> = IdTracker::new();
+
     let addr = "127.0.0.1:1080".parse().unwrap();
     let listener = TcpListener::bind(&addr).unwrap();
-    let server = listener.incoming().for_each(move |socket| {
-        process(socket);
+    let server = listener.incoming().for_each(|socket| {
+        let circuit = create_circuit(&mut core, dir_server, &peers, &mut circ_id_tracker).unwrap();
+        process(socket, circuit);
         Ok(())
     })
     .map_err(|err| {
@@ -498,51 +495,83 @@ fn do_proxy(peers: dir::TorPeerList, mut circ_id_tracker: IdTracker<u32>) {
 */
 
 /*
-fn process(socket: TcpStream) {
+struct ReadUntil {
+    stream: Option<TcpStream>,
+    buffer: Vec<u8>,
+}
+
+impl Future for ReadUntil {
+    type Item = (TcpStream, Vec<u8>);
+    type Error = io::Error;
+
+    fn poll(&mut self) -> Result<Async<(TcpStream, Vec<u8>)>, io::Error> {
+        let stream = match self.stream.take() {
+            Some(stream) => stream,
+            None => return Err(Error::new(ErrorKind::Other, "stream should be Some here")),
+        };
+        loop {
+            let mut buf: [u8; 1] = [0; 1];
+            match stream.poll_read(&mut buf)? {
+                Async::Ready(n) => {
+                    if n == 0 {
+                        return Err(Error::new(ErrorKind::UnexpectedEof, "unexpected eof"));
+                    }
+                    if buf[0] == 0 {
+                        return Ok(Async::Ready((stream, self.buffer.clone())));
+                    }
+                    self.buffer.push(buf[0]);
+                }
+                Async::NotReady => {}
+            }
+        }
+    }
+}
+
+fn process(socket: TcpStream, circuit: OpensslCircuit) -> () {
     let buf: [u8; 9] = [0; 9];
-    let socks4_connection = io::read_exact(socket, buf)
+    let socks4_connection = tokio::io::read_exact(socket, buf)
         .and_then(|(socket, buf)| {
             let mut reader = &buf[..];
             let version = reader.read_u8()?;
             if version != 4 {
                 return Err(Error::new(ErrorKind::InvalidInput, "invalid version"));
-                //return io::write_all(socket, vec![0, 0x5b]) // request rejected/failed code
+                //return tokio::io::write_all(socket, vec![0, 0x5b]) // request rejected/failed code
             }
             let command = reader.read_u8()?;
             if command != 1 {
                 return Err(Error::new(ErrorKind::InvalidInput, "invalid command"));
-                //return io::write_all(socket, vec![0, 0x5b]); // request rejected/failed code
+                //return tokio::io::write_all(socket, vec![0, 0x5b]); // request rejected/failed code
             }
             let port = reader.read_u16::<NetworkEndian>()?;
             let mut ip_addr: [u8; 4] = [0; 4];
             reader.read(&mut ip_addr)?;
-            let ip_addr = Ipv4Addr::from(ip_addr);
             let null_terminator = reader.read_u8()?;
             if null_terminator != 0 {
                 return Err(Error::new(ErrorKind::InvalidInput, "invalid user"));
-                //return io::write_all(socket, vec![0, 0x5b]); // request rejected/failed code
+                //return tokio::io::write_all(socket, vec![0, 0x5b]); // request rejected/failed code
             }
             let mut domain_buf: Vec<u8> = Vec::with_capacity(256);
             domain_buf.resize(256, 0);
-            io::read_until(socket, 0, domain_buf).then(move |(socket, buf)| {
+            Ok(ReadUntil { stream: Some(socket), buffer: Vec::new() }.and_then(|(socket, buf)| {
                 let domain = String::from_utf8(buf).unwrap();
-                Ok((socket, domain, SocketAddr::new(IpAddr::V4(ip_addr), port)))
-            })
+                Ok((socket, domain, ip_addr, port))
+            }))
         })
         .and_then(|(client_socket, domain, ip_address, port)| {
             let mut outbuf: [u8; 8] = [0; 8];
             {
                 let mut writer = &mut outbuf[..];
-                writer.write_u8(0)?;
-                writer.write_u8(0x5a)?;
-                writer.write_u16::<NetworkEndian>(port)?;
-                writer.write_all(&ip_address.octets())?;
+                writer.write_u8(0).unwrap();
+                writer.write_u8(0x5a).unwrap();
+                writer.write_u16::<NetworkEndian>(port).unwrap();
+                writer.write_all(ip_address).unwrap();
             } // c'mon liveness detection :(
-            io::write_all(client_socket, outbuf).then(move |(client_socket, _)| {
+            tokio::io::write_all(client_socket, outbuf).then(move |(client_socket, _buf)| {
                 Ok((client_socket, domain, port))
             })
         })
         .and_then(|(client_socket, domain, port)| {
+            println!("should connect to {}:{}", domain, port);
             /*
             let mut retries = 5;
             let mut circuit_result = setup_new_circuit(&peers, &mut circ_id_tracker);
@@ -560,7 +589,8 @@ fn process(socket: TcpStream) {
                 Err(_) => break,
             };
             */
-        })
+            Ok(())
+        });
         .and_then(|((client_socket, _), server_socket)| {
             let (read_client, write_client) = client_socket.split();
             let (read_server, write_server) = server_socket.split();
