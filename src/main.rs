@@ -6,9 +6,8 @@ extern crate toroxide_openssl;
 
 use byteorder::{NetworkEndian, ReadBytesExt, WriteBytesExt};
 use std::io::{self, Error, ErrorKind, Read, Write};
-use std::net::{IpAddr, SocketAddr};
-use std::env;
-use std::str;
+use std::net::{IpAddr, ToSocketAddrs, SocketAddr};
+use std::{env, str};
 use tokio::io::{read_to_end, read_exact, write_all};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::prelude::{Async, Future, Stream};
@@ -334,8 +333,8 @@ fn async_get_microdescriptor(
 ) -> Box<Future<Item = String, Error = io::Error> + Send> {
     // TODO: tokio doesn't re-export future::err?
     // TODO: support domain names as well
-    let socket_addr = dir_server.parse().unwrap();
-    Box::new(TcpStream::connect(&socket_addr).and_then(move |stream| {
+    let socket_addr = &dir_server.to_socket_addrs().unwrap().next().unwrap();
+    Box::new(TcpStream::connect(socket_addr).and_then(move |stream| {
         let request = format!("GET {} HTTP/1.0\r\n\r\n", microdescriptor_path);
         write_all(stream, request.clone())
     }).and_then(|(stream, _)| {
