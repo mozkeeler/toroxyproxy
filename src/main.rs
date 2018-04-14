@@ -1,107 +1,238 @@
 extern crate byteorder;
-extern crate tokio;
-extern crate tokio_io;
 extern crate toroxide;
 extern crate toroxide_openssl;
 
 use byteorder::{NetworkEndian, ReadBytesExt, WriteBytesExt};
 use std::io::{self, Error, ErrorKind, Read, Write};
-use std::net::{IpAddr, ToSocketAddrs, SocketAddr};
-use std::{env, str};
-use std::sync::mpsc::{sync_channel, Receiver};
-use tokio::io::{read_to_end, read_exact, write_all};
-use tokio::net::{TcpListener, TcpStream};
-use tokio::prelude::{Async, Future, Stream};
-use tokio::prelude::future::{Either, failed};
-use tokio::runtime::Runtime;
-use tokio_io::{AsyncRead, AsyncWrite};
-use toroxide::{dir, Circuit, IdTracker};
+use std::net::{IpAddr, ToSocketAddrs, SocketAddr, TcpListener, TcpStream};
+use std::{env, str, thread};
+use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
+use toroxide::{Async, Circuit, IdTracker};
+use toroxide::dir::{PreTorPeer, TorPeer, TorPeerList};
 use toroxide_openssl::{PendingTlsOpensslImpl, RsaSignerOpensslImpl, RsaVerifierOpensslImpl,
                        TlsOpensslImpl};
 
 fn usage(program: &str) {
-    println!("Usage: {} <directory server>:<port> <demo|proxy>", program);
+    println!("Usage: {} <directory server>:<port>", program);
 }
 
 fn main() {
     let args: Vec<String> = env::args().collect();
-    if args.len() != 3 {
+    if args.len() != 2 {
         usage(&args[0]);
         return;
     }
     let dir_server = &args[1];
+    do_proxy(dir_server.to_owned()).unwrap();
+}
 
-    if args[2] == "demo" {
-        do_demo(dir_server).unwrap();
-    } else if args[2] == "proxy" {
-        do_proxy(dir_server);
-    } else {
-        panic!("unknown command '{}'", args[2]);
+fn do_proxy(dir_server: String) -> Result<(), Error> {
+    let listener = TcpListener::bind("127.0.0.1:1080")?;
+    // TODO: increase this to pipeline more requests?
+    let (tx, rx): (SyncSender<TcpStream>, Receiver<TcpStream>) = sync_channel(1);
+    let socks_thread_handle = thread::spawn(move || socks_thread(dir_server.to_owned(), rx));
+    for stream in listener.incoming() {
+        match stream {
+            Ok(stream) => match tx.send(stream) {
+                Ok(()) => {},
+                Err(e) => println!("error sending stream: {:?}", e),
+            }
+            Err(e) => println!("error accepting connection: {:?}", e),
+        }
+    }
+    socks_thread_handle.join().map_err(|_| Error::new(ErrorKind::Other, "couldn't join thread?"))?;
+    Ok(())
+}
+
+type SocksPrelude = (TcpStream, String, u16);
+fn socks_thread(dir_server: String, stream_rx: Receiver<TcpStream>) {
+    let (tx, rx) : (SyncSender<SocksPrelude>, Receiver<SocksPrelude>) = sync_channel(1);
+    let pipe_thread_handle = thread::spawn(move || pipe_thread(dir_server, rx));
+    loop {
+        match stream_rx.recv() {
+            Ok(stream) => match socks4a_prelude(stream, &tx) {
+                Ok(()) => {},
+                Err(e) => {
+                    println!("socks4a_prelude failed: {:?}", e);
+                }
+            }
+            Err(e) => {
+                println!("stream_rx.recv() failed: {:?}", e);
+                break;
+            }
+        }
+    }
+    pipe_thread_handle.join().unwrap();
+}
+
+fn socks4a_prelude(mut stream: TcpStream, tx: &SyncSender<SocksPrelude>) -> Result<(), Error> {
+    let mut buf: [u8; 9] = [0; 9];
+    stream.read_exact(&mut buf)?;
+    let mut reader = &buf[..];
+    let version = reader.read_u8()?;
+    if version != 4 {
+        stream.write_all(&[0x00, 0x5b])?;
+        return Err(Error::new(ErrorKind::InvalidInput, "invalid version"));
+    }
+    let command = reader.read_u8()?;
+    if command != 1 {
+        stream.write_all(&[0x00, 0x5b])?;
+        return Err(Error::new(ErrorKind::InvalidInput, "invalid command"));
+    }
+    let port = reader.read_u16::<NetworkEndian>()?;
+    let mut ip_addr: [u8; 4] = [0; 4];
+    reader.read(&mut ip_addr)?;
+    let null_terminator = reader.read_u8()?;
+    if null_terminator != 0 {
+        stream.write_all(&[0x00, 0x5b])?;
+        return Err(Error::new(ErrorKind::InvalidInput, "non-null users not supported"));
+    }
+    let mut domain_buf: Vec<u8> = Vec::with_capacity(256);
+    loop {
+        let mut buf: [u8; 1] = [0; 1];
+        stream.read_exact(&mut buf)?;
+        if buf[0] == 0 {
+            break;
+        }
+        domain_buf.extend(buf.iter());
+    }
+    let domain = match String::from_utf8(domain_buf) {
+        Ok(domain) => domain,
+        Err(_) => {
+            stream.write_all(&[0x00, 0x5b])?;
+            return Err(Error::new(ErrorKind::InvalidInput, "invalid domain name"));
+        }
+    };
+    let mut outbuf: [u8; 8] = [0; 8];
+    {
+        let mut writer = &mut outbuf[..];
+        writer.write_u8(0)?;
+        writer.write_u8(0x5a)?;
+        writer.write_u16::<NetworkEndian>(port)?;
+        writer.write_all(&ip_addr)?;
+    } // c'mon liveness detection :(
+    stream.write_all(&mut outbuf)?;
+    match tx.send((stream, domain, port)) {
+        Ok(()) => {},
+        Err(e) => {
+            println!("failed to send socks prelude: {:?}", e);
+        }
+    }
+    Ok(())
+}
+
+fn pipe_thread(dir_server: String, socks_rx: Receiver<SocksPrelude>) {
+    let (tx, rx) : (SyncSender<OpensslCircuit>, Receiver<OpensslCircuit>) = sync_channel(1);
+    let circuit_creation_thread_handle = thread::spawn(move || {
+        circuit_creation_thread(dir_server, tx);
+    });
+    loop {
+        let circuit = match rx.recv() {
+            Ok(circuit) => circuit,
+            Err(e) => {
+                println!("couldn't receive circuit? ({:?})", e);
+                break;
+            }
+        };
+        //let streams = Vec::new();
+        loop {
+            let (stream, domain, port) = match socks_rx.recv() {
+                Ok(socks_prelude) => socks_prelude,
+                Err(e) => {
+                    println!("couldn't receive socks prelude? ({:?})", e);
+                    break;
+                }
+            };
+            // open stream in circuit, etc...
+        }
+    }
+    circuit_creation_thread_handle.join().unwrap();
+}
+
+fn circuit_creation_thread(dir_server: String, circuit_tx: SyncSender<OpensslCircuit>) {
+    let mut circ_id_tracker: IdTracker<u32> = IdTracker::new();
+    let peers = match get_peer_list(&dir_server) {
+        Ok(peers) => peers,
+        Err(e) => {
+            println!("get_peer_list failed: {:?}", e);
+            return;
+        }
+    };
+    loop {
+        let circuit = match create_circuit(&dir_server, &mut circ_id_tracker, &peers) {
+            Ok(circuit) => circuit,
+            Err(e) => {
+                println!("couldn't create new circuit: {:?}", e);
+                return;
+            }
+        };
+        let circ_id = circ_id_tracker.get_new_id();
     }
 }
 
-fn do_demo(dir_server: &str) -> Result<(), io::Error> {
-    let peers = get_peer_list(dir_server)?;
-    let mut circ_id_tracker: IdTracker<u32> = IdTracker::new();
-    let circ_id = circ_id_tracker.get_new_id();
-    let pre_guard_node = peers.get_guard_node().expect("couldn't get guard node?").clone();
+fn create_circuit(
+    dir_server: &str,
+    circ_id_tracker: &mut IdTracker<u32>,
+    peers: &TorPeerList
+) -> Result<OpensslCircuit, Error> {
+    let pre_guard_node = peers.get_guard_node()
+        .ok_or(Error::new(ErrorKind::Other, "couldn't get guard node?"))?;
     let pre_interior_node = peers.get_interior_node(&[&pre_guard_node])
-        .expect("couldn't get interior node?").clone();
+        .ok_or(Error::new(ErrorKind::Other, "couldn't get interior node?"))?;
     let pre_exit_node = peers.get_exit_node(&[&pre_guard_node, &pre_interior_node])
-        .expect("couldn't get exit node?").clone();
-    let nodes = [pre_guard_node, pre_interior_node, pre_exit_node];
-    let task = create_circuit(dir_server, nodes, circ_id).and_then(|circuit| {
-        let request = r#"GET / HTTP/1.1
-Host: example.com
-User-Agent: toroxide/0.1.0
-Accept: text/html
-Accept-Language: en-US,en;q=0.5
-Connection: close
+        .ok_or(Error::new(ErrorKind::Other, "couldn't get exit node?"))?;
+    let microdescriptor_path = pre_guard_node.get_microdescriptor_path();
+    let microdescriptor = get_microdescriptor(&dir_server, microdescriptor_path)?;
+    let circ_id = circ_id_tracker.get_new_id();
 
-"#;
-        let hostport = "example.com:80";
-        CircuitDataFuture::new(circuit, hostport, request.as_bytes())
-    }).and_then(|(circuit, response)| {
-        println!("{}", String::from_utf8(response).unwrap());
-        let request = r#"GET / HTTP/1.1
-Host: ip.seeip.org
-User-Agent: toroxide/0.1.0
-Connection: close
-
-"#;
-        let hostport = "ip.seeip.org:80";
-        CircuitDataFuture::new(circuit, hostport, request.as_bytes())
-    }).and_then(|(_, response)| {
-        println!("{}", String::from_utf8(response).unwrap());
-        Ok(())
-    }).map_err(|e| {
-        println!("error: {:?}", e);
-    }).then(|_| {
-        println!("done...");
-        Ok(())
-    });
-    tokio::run(task);
-    Ok(())
+    let guard_node = pre_guard_node.to_tor_peer(&microdescriptor)?;
+    let addr = SocketAddr::new(IpAddr::V4(guard_node.get_ip_addr()), guard_node.get_port());
+    let stream = TcpStream::connect(&addr)?;
+    let pending_tls_stream = PendingTlsOpensslImpl::new(stream)?;
+    let mut tls_stream_future = TlsStreamFuture { pending_tls_stream };
+    let mut tls_stream = None;
+    loop {
+        if let Async::Ready(ready_tls_stream) = tls_stream_future.poll()? {
+            tls_stream = Some(ready_tls_stream);
+            break;
+        }
+    }
+    let tls_stream = match tls_stream.take() {
+        Some(tls_stream) => tls_stream,
+        None => return Err(Error::new(ErrorKind::Other, "bug - tls_stream should be Some")),
+    };
+    let rsa_verifier = RsaVerifierOpensslImpl {};
+    let rsa_signer = RsaSignerOpensslImpl::new();
+    let circuit = Circuit::new(tls_stream, rsa_verifier, &rsa_signer, circ_id,
+                               guard_node.get_ed25519_id_key());
+    let mut circuit_open_future = CircuitOpenFuture { circuit: Some(circuit) };
+    let mut opened_circuit = None;
+    loop {
+        if let Async::Ready(ready_opened_circuit) = circuit_open_future.poll()? {
+            opened_circuit = Some(ready_opened_circuit);
+            break;
+        }
+    }
+    let opened_circuit = match opened_circuit.take() {
+        Some(opened_circuit) => opened_circuit,
+        None => return Err(Error::new(ErrorKind::Other, "bug - opened_circuit should be Some")),
+    };
+    Ok(opened_circuit)
 }
 
 struct TlsStreamFuture {
     pending_tls_stream: PendingTlsOpensslImpl<TcpStream>,
 }
 
-impl Future for TlsStreamFuture {
-    type Item = TlsOpensslImpl<TcpStream>;
-    type Error = io::Error;
-
-    // Remember, we can't return Async::NotReady unless we got it from something in the futures
-    // world (not toroxide), so we just loop indefinitely here...
-    fn poll(&mut self) -> Result<Async<TlsOpensslImpl<TcpStream>>, io::Error> {
+impl TlsStreamFuture {
+    fn poll(&mut self) -> Result<Async<TlsOpensslImpl<TcpStream>>, Error> {
         loop {
             match self.pending_tls_stream.poll()? {
-                toroxide::Async::Ready(tls_stream) => {
+                Async::Ready(tls_stream) => {
                     println!("I guess we conencted?");
                     return Ok(Async::Ready(tls_stream));
                 }
-                toroxide::Async::NotReady => {},
+                Async::NotReady => {},
             }
         }
     }
@@ -113,13 +244,8 @@ struct CircuitOpenFuture {
     circuit: Option<OpensslCircuit>,
 }
 
-impl Future for CircuitOpenFuture {
-    type Item = OpensslCircuit;
-    type Error = io::Error;
-
-    // Remember, we can't return Async::NotReady unless we got it from something in the futures
-    // world (not toroxide), so we just loop indefinitely here...
-    fn poll(&mut self) -> Result<Async<OpensslCircuit>, io::Error> {
+impl CircuitOpenFuture {
+    fn poll(&mut self) -> Result<Async<OpensslCircuit>, Error> {
         let mut circuit = match self.circuit.take() {
             Some(circuit) => circuit,
             None => {
@@ -129,11 +255,11 @@ impl Future for CircuitOpenFuture {
         };
         loop {
             match circuit.poll()? {
-                toroxide::Async::Ready(()) => {
+                Async::Ready(()) => {
                     println!("I guess the circuit's ready?");
                     return Ok(Async::Ready(circuit));
                 }
-                toroxide::Async::NotReady => {},
+                Async::NotReady => {},
             }
         }
     }
@@ -147,14 +273,14 @@ enum CircuitDirFutureState {
 
 struct CircuitDirFuture {
     circuit: Option<OpensslCircuit>,
-    pre_node: toroxide::dir::PreTorPeer,
+    pre_node: PreTorPeer,
     request: Vec<u8>,
     response: Vec<u8>,
     state: CircuitDirFutureState,
 }
 
 impl CircuitDirFuture {
-    fn new(circuit: OpensslCircuit, pre_node: toroxide::dir::PreTorPeer) -> CircuitDirFuture {
+    fn new(circuit: OpensslCircuit, pre_node: PreTorPeer) -> CircuitDirFuture {
         let microdescriptor_path = pre_node.get_microdescriptor_path();
         let request = format!("GET {} HTTP/1.0\r\n\r\n", microdescriptor_path);
         println!("{}", request);
@@ -166,15 +292,8 @@ impl CircuitDirFuture {
             state: CircuitDirFutureState::Setup,
         }
     }
-}
 
-impl Future for CircuitDirFuture {
-    type Item = (OpensslCircuit, Result<toroxide::dir::TorPeer, ()>);
-    type Error = io::Error;
-
-    fn poll(
-        &mut self,
-    ) -> Result<Async<(OpensslCircuit, Result<toroxide::dir::TorPeer, ()>)>, io::Error> {
+    fn poll(&mut self) -> Result<Async<(OpensslCircuit, TorPeer)>, Error> {
         let mut circuit = match self.circuit.take() {
             Some(circuit) => circuit,
             None => {
@@ -187,37 +306,38 @@ impl Future for CircuitDirFuture {
             match self.state {
                 CircuitDirFutureState::Setup => {
                     match circuit.poll_stream_setup(stream_id)? {
-                        toroxide::Async::Ready(()) => self.state = CircuitDirFutureState::RequestWriting,
-                        toroxide::Async::NotReady => continue,
+                        Async::Ready(()) => self.state = CircuitDirFutureState::RequestWriting,
+                        Async::NotReady => continue,
                     }
                 }
                 CircuitDirFutureState::RequestWriting => {
                     match circuit.poll_stream_write(stream_id, &self.request)? {
-                        toroxide::Async::Ready(()) => self.state = CircuitDirFutureState::ResponseReading,
-                        toroxide::Async::NotReady => continue,
+                        Async::Ready(()) => self.state = CircuitDirFutureState::ResponseReading,
+                        Async::NotReady => continue,
                     }
                 }
                 CircuitDirFutureState::ResponseReading => {
                     match circuit.poll_stream_read(stream_id)? {
-                        toroxide::Async::Ready(mut response) => {
+                        Async::Ready(mut response) => {
                             // We've reached the end of what we're being sent if we get a
                             // zero-length response (although right now toroxide doesn't enforce
                             // that peers don't send us zero-length DATA cells...)
                             if response.len() == 0 {
-                                let as_string = match str::from_utf8(&self.response) {
-                                    Ok(as_string) => as_string,
-                                    Err(_) => return Ok(Async::Ready((circuit, Err(())))),
-                                };
+                                let as_string = str::from_utf8(&self.response).map_err(|e| {
+                                    Error::new(ErrorKind::Other, e)
+                                })?;
                                 let index = match as_string.find("\r\n\r\n") {
                                     Some(index) => index,
-                                    None => return Ok(Async::Ready((circuit, Err(())))),
+                                    None => {
+                                        return Err(Error::new(ErrorKind::Other, "bad response"));
+                                    }
                                 };
-                                let result = self.pre_node.to_tor_peer(&as_string[index + 4..]);
-                                return Ok(Async::Ready((circuit, result)));
+                                let peer = self.pre_node.to_tor_peer(&as_string[index + 4..])?;
+                                return Ok(Async::Ready((circuit, peer)));
                             }
                             self.response.append(&mut response);
                         }
-                        toroxide::Async::NotReady => {},
+                        Async::NotReady => {},
                     }
                 }
             }
@@ -227,14 +347,11 @@ impl Future for CircuitDirFuture {
 
 struct CircuitExtendFuture {
     circuit: Option<OpensslCircuit>,
-    node: toroxide::dir::TorPeer,
+    node: TorPeer,
 }
 
-impl Future for CircuitExtendFuture {
-    type Item = OpensslCircuit;
-    type Error = io::Error;
-
-    fn poll(&mut self) -> Result<Async<OpensslCircuit>, io::Error> {
+impl CircuitExtendFuture {
+    fn poll(&mut self) -> Result<Async<OpensslCircuit>, Error> {
         let mut circuit = match self.circuit.take() {
             Some(circuit) => circuit,
             None => {
@@ -244,8 +361,8 @@ impl Future for CircuitExtendFuture {
         };
         loop {
             match circuit.poll_extend(&self.node)? {
-                toroxide::Async::Ready(()) => return Ok(Async::Ready(circuit)),
-                toroxide::Async::NotReady => {},
+                Async::Ready(()) => return Ok(Async::Ready(circuit)),
+                Async::NotReady => {},
             }
         }
     }
@@ -275,13 +392,8 @@ impl CircuitDataFuture {
             state: CircuitDataFutureState::Setup,
         }
     }
-}
 
-impl Future for CircuitDataFuture {
-    type Item = (OpensslCircuit, Vec<u8>);
-    type Error = io::Error;
-
-    fn poll(&mut self) -> Result<Async<(OpensslCircuit, Vec<u8>)>, io::Error> {
+    fn poll(&mut self) -> Result<Async<(OpensslCircuit, Vec<u8>)>, Error> {
         let mut circuit = match self.circuit.take() {
             Some(circuit) => circuit,
             None => {
@@ -294,25 +406,25 @@ impl Future for CircuitDataFuture {
             match self.state {
                 CircuitDataFutureState::Setup => {
                     match circuit.poll_stream_setup(stream_id)? {
-                        toroxide::Async::Ready(()) => self.state = CircuitDataFutureState::Writing,
-                        toroxide::Async::NotReady => continue,
+                        Async::Ready(()) => self.state = CircuitDataFutureState::Writing,
+                        Async::NotReady => continue,
                     }
                 }
                 CircuitDataFutureState::Writing => {
                     match circuit.poll_stream_write(stream_id, &self.request)? {
-                        toroxide::Async::Ready(()) => self.state = CircuitDataFutureState::Reading,
-                        toroxide::Async::NotReady => continue,
+                        Async::Ready(()) => self.state = CircuitDataFutureState::Reading,
+                        Async::NotReady => continue,
                     }
                 }
                 CircuitDataFutureState::Reading => {
                     match circuit.poll_stream_read(stream_id)? {
-                        toroxide::Async::Ready(mut response) => {
+                        Async::Ready(mut response) => {
                             if response.len() == 0 {
                                 return Ok(Async::Ready((circuit, self.response.clone())));
                             }
                             self.response.append(&mut response);
                         }
-                        toroxide::Async::NotReady => {},
+                        Async::NotReady => {},
                     }
                 }
             }
@@ -321,8 +433,8 @@ impl Future for CircuitDataFuture {
 }
 
 // Synchronously fetches the peer list from the directory server.
-fn get_peer_list(dir_server: &str) -> io::Result<dir::TorPeerList> {
-    let mut stream = std::net::TcpStream::connect(dir_server)?;
+fn get_peer_list(dir_server: &str) -> Result<TorPeerList, Error> {
+    let mut stream = TcpStream::connect(dir_server)?;
     let request = "GET /tor/status-vote/current/consensus-microdesc/ HTTP/1.0\r\n\r\n";
     stream.write_all(request.as_bytes())?;
     let mut buf = String::new();
@@ -332,36 +444,27 @@ fn get_peer_list(dir_server: &str) -> io::Result<dir::TorPeerList> {
         None => return Err(Error::new(ErrorKind::Other, "bad response from directory server")),
     };
     println!("returning '{}'", &buf[index + 4..]);
-    Ok(dir::TorPeerList::new(&buf[index + 4..]))
+    Ok(TorPeerList::new(&buf[index + 4..]))
 }
 
-fn async_get_microdescriptor(
-    dir_server: &str,
-    microdescriptor_path: String,
-) -> Box<Future<Item = String, Error = io::Error> + Send> {
-    // TODO: tokio doesn't re-export future::err? (oh, maybe it's in the prelude?)
-    // TODO: support domain names as well
-    let socket_addr = &dir_server.to_socket_addrs().unwrap()
-        .filter(|addr| addr.is_ipv4()).next().unwrap();
-    Box::new(TcpStream::connect(socket_addr).and_then(move |stream| {
-        let request = format!("GET {} HTTP/1.0\r\n\r\n", microdescriptor_path);
-        write_all(stream, request.clone())
-    }).and_then(|(stream, _)| {
-        let buf = Vec::new();
-        read_to_end(stream, buf)
-    }).and_then(|(_, buf)| {
-        let as_string = String::from_utf8(buf).map_err(|e| Error::new(ErrorKind::Other, e))?;
-        let index = match as_string.find("\r\n\r\n") {
-            Some(index) => index,
-            None => return Err(Error::new(ErrorKind::Other, "bad response from directory server")),
-        };
-        Ok(as_string[index + 4..].to_owned())
-    }))
+// Synchronously fetches the corresponding microdescriptor from the directory server.
+fn get_microdescriptor(dir_server: &str, microdescriptor_path: String) -> Result<String, Error> {
+    let mut stream = TcpStream::connect(dir_server)?;
+    let request = format!("GET {} HTTP/1.0\r\n\r\n", microdescriptor_path);
+    stream.write_all(request.as_bytes())?;
+    let mut response = String::new();
+    stream.read_to_string(&mut response)?;
+    let index = match response.find("\r\n\r\n") {
+        Some(index) => index,
+        None => return Err(Error::new(ErrorKind::Other, "bad response from directory server")),
+    };
+    Ok(response[index + 4..].to_owned())
 }
 
+/*
 fn create_circuit(
     dir_server: &str,
-    nodes: [dir::PreTorPeer; 3],
+    nodes: [PreTorPeer; 3],
     circ_id: u32,
 ) -> Box<Future<Item = OpensslCircuit, Error = io::Error> + Send> {
     let pre_guard_node = nodes[0].clone();
@@ -407,7 +510,9 @@ fn create_circuit(
         }
     }))
 }
+*/
 
+/*
 #[derive(PartialEq)]
 enum CircuitStreamState {
     Setup,
@@ -440,7 +545,7 @@ impl CircuitPiper {
     fn socket_to_circuit(
         &mut self,
         stream: &mut CircuitStream,
-    ) -> Result<Async<()>, io::Error> {
+    ) -> Result<Async<()>, Error> {
         let mut buf = Vec::with_capacity(498);
         match stream.stream.read_buf(&mut buf)? {
             Async::Ready(n) => {
@@ -455,7 +560,7 @@ impl CircuitPiper {
     fn circuit_to_socket(
         &mut self,
         stream: &mut CircuitStream,
-    ) -> Result<Async<()>, io::Error> {
+    ) -> Result<Async<()>, Error> {
         match self.circuit.poll_stream_read(stream.stream_id)? {
             toroxide::Async::Ready(data) => {
                 // TODO polling here...?
@@ -476,13 +581,8 @@ impl CircuitPiper {
         }
         Ok(Async::NotReady)
     }
-}
 
-impl Future for CircuitPiper {
-    type Item = ();
-    type Error = io::Error;
-
-    fn poll(&mut self) -> Result<Async<()>, io::Error> {
+    fn poll(&mut self) -> Result<Async<()>, Error> {
         let mut streams = Vec::new();
         loop {
             match self.receiver.try_recv() {
@@ -562,11 +662,8 @@ struct ReadUntil {
     buffer: Vec<u8>,
 }
 
-impl Future for ReadUntil {
-    type Item = (TcpStream, Vec<u8>);
-    type Error = io::Error;
-
-    fn poll(&mut self) -> Result<Async<(TcpStream, Vec<u8>)>, io::Error> {
+impl ReadUntil {
+    fn poll(&mut self) -> Result<Async<(TcpStream, Vec<u8>)>, Error> {
         let mut stream = match self.stream.take() {
             Some(stream) => stream,
             None => return Err(Error::new(ErrorKind::Other, "stream should be Some here")),
@@ -591,7 +688,7 @@ impl Future for ReadUntil {
 
 fn socks4a_prelude(
     socket: TcpStream
-) -> Box<Future<Item = (TcpStream, String, u16), Error = io::Error> + Send> {
+) -> Box<Future<Item = (TcpStream, String, u16), Error = Error> + Send> {
     let buf: [u8; 9] = [0; 9];
     let socks4_connection = read_exact(socket, buf).and_then(|(socket, buf)| {
         let mut reader = &buf[..];
@@ -645,9 +742,9 @@ type SocksConnectionReceiver = Receiver<(TcpStream, String, u16)>;
 
 fn circuit_poller(
     dir_server: &str,
-    peers: dir::TorPeerList,
+    peers: TorPeerList,
     receiver: SocksConnectionReceiver
-) -> Box<Future<Item = (), Error = io::Error> + Send> {
+) -> Box<Future<Item = (), Error = Error> + Send> {
     let mut circ_id_tracker: IdTracker<u32> = IdTracker::new();
     let pre_guard_node = peers.get_guard_node().expect("couldn't get guard node?").clone();
     let pre_interior_node = peers.get_interior_node(&[&pre_guard_node])
@@ -661,3 +758,4 @@ fn circuit_poller(
     });
     Box::new(task)
 }
+*/
