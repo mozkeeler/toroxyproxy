@@ -5,7 +5,7 @@ extern crate toroxide_openssl;
 use byteorder::{NetworkEndian, ReadBytesExt, WriteBytesExt};
 use std::io::{Error, ErrorKind, Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
-use std::{env, str, thread};
+use std::{env, str, thread, time};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TryRecvError};
 use toroxide::{Async, Circuit, IdTracker};
 use toroxide::dir::{PreTorPeer, TorPeer, TorPeerList};
@@ -29,7 +29,7 @@ fn main() {
 fn do_proxy(dir_server: String) -> Result<(), Error> {
     let listener = TcpListener::bind("127.0.0.1:1080")?;
     // TODO: increase this to pipeline more requests?
-    let (tx, rx): (SyncSender<TcpStream>, Receiver<TcpStream>) = sync_channel(1);
+    let (tx, rx): (SyncSender<TcpStream>, Receiver<TcpStream>) = sync_channel(0);
     let socks_thread_handle = thread::spawn(move || socks_thread(dir_server.to_owned(), rx));
     println!("listening?");
     for stream in listener.incoming() {
@@ -47,7 +47,7 @@ fn do_proxy(dir_server: String) -> Result<(), Error> {
 
 type SocksPrelude = (TcpStream, String, u16);
 fn socks_thread(dir_server: String, stream_rx: Receiver<TcpStream>) {
-    let (tx, rx) : (SyncSender<SocksPrelude>, Receiver<SocksPrelude>) = sync_channel(1);
+    let (tx, rx) : (SyncSender<SocksPrelude>, Receiver<SocksPrelude>) = sync_channel(0);
     let pipe_thread_handle = thread::spawn(move || pipe_thread(dir_server, rx));
     loop {
         match stream_rx.recv() {
@@ -123,11 +123,23 @@ fn socks4a_prelude(mut stream: TcpStream, tx: &SyncSender<SocksPrelude>) -> Resu
 }
 
 fn pipe_thread(dir_server: String, mut socks_rx: Receiver<SocksPrelude>) {
-    let (tx, rx) : (SyncSender<OpensslCircuit>, Receiver<OpensslCircuit>) = sync_channel(1);
+    /*
+    let (tx, rx) : (SyncSender<OpensslCircuit>, Receiver<OpensslCircuit>) = sync_channel(0);
     let circuit_creation_thread_handle = thread::spawn(move || {
         circuit_creation_thread(dir_server, tx);
     });
+    let mut num_circuits_received = 0;
+    */
+    let mut circ_id_tracker: IdTracker<u32> = IdTracker::new();
+    let peers = match get_peer_list(&dir_server) {
+        Ok(peers) => peers,
+        Err(e) => {
+            println!("get_peer_list failed: {:?}", e);
+            return;
+        }
+    };
     loop {
+        /*
         let circuit = match rx.recv() {
             Ok(circuit) => circuit,
             Err(e) => {
@@ -135,7 +147,16 @@ fn pipe_thread(dir_server: String, mut socks_rx: Receiver<SocksPrelude>) {
                 break;
             }
         };
-        println!("got circuit");
+        num_circuits_received += 1;
+        println!("received {} total circuits", num_circuits_received);
+        */
+        let circuit = match create_circuit(&dir_server, &mut circ_id_tracker, &peers) {
+            Ok(circuit) => circuit,
+            Err(e) => {
+                println!("couldn't create new circuit: {:?}", e);
+                return;
+            }
+        };
         let mut piper = CircuitPiper::new(circuit, &mut socks_rx);
         loop {
             let async = match piper.poll() {
@@ -151,9 +172,10 @@ fn pipe_thread(dir_server: String, mut socks_rx: Receiver<SocksPrelude>) {
             }
         }
     }
-    circuit_creation_thread_handle.join().unwrap();
+    //circuit_creation_thread_handle.join().unwrap();
 }
 
+/*
 fn circuit_creation_thread(dir_server: String, circuit_tx: SyncSender<OpensslCircuit>) {
     let mut circ_id_tracker: IdTracker<u32> = IdTracker::new();
     let peers = match get_peer_list(&dir_server) {
@@ -163,6 +185,7 @@ fn circuit_creation_thread(dir_server: String, circuit_tx: SyncSender<OpensslCir
             return;
         }
     };
+    let mut num_created_circuits = 0;
     loop {
         let circuit = match create_circuit(&dir_server, &mut circ_id_tracker, &peers) {
             Ok(circuit) => circuit,
@@ -171,6 +194,8 @@ fn circuit_creation_thread(dir_server: String, circuit_tx: SyncSender<OpensslCir
                 return;
             }
         };
+        num_created_circuits += 1;
+        println!("created {} circuit(s) total", num_created_circuits);
         match circuit_tx.send(circuit) {
             Ok(()) => {
                 println!("sent new circuit");
@@ -181,6 +206,7 @@ fn circuit_creation_thread(dir_server: String, circuit_tx: SyncSender<OpensslCir
         }
     }
 }
+*/
 
 fn create_circuit(
     dir_server: &str,
@@ -440,8 +466,6 @@ struct CircuitStream {
     stream: TcpStream,
     stream_id: u16,
     state: CircuitStreamState,
-    inbound_closed: bool,
-    outbound_closed: bool,
 }
 
 impl CircuitStream {
@@ -450,8 +474,6 @@ impl CircuitStream {
             stream,
             stream_id,
             state: CircuitStreamState::Setup,
-            inbound_closed: false,
-            outbound_closed: false,
         }
     }
 }
@@ -480,18 +502,23 @@ impl<'a> CircuitPiper<'a> {
                 // TODO polling here...?
                 self.circuit.poll_stream_write(stream.stream_id, &buf[..n])?;
             }
-            // TODO: differentiate not ready from other error
-            Err(e) => {}
+            Err(ref e) if e.kind() == ErrorKind::WouldBlock => return Ok(Async::NotReady),
+            Err(e) => {
+                println!("socket_to_circuit: {:?} (socket closed? closing stream)", e);
+                return Ok(Async::Ready(()));
+            }
         }
         Ok(Async::NotReady)
     }
 
+    // I guess the contract here is if we Err'd reading from the circuit we return an Err but if we
+    // Err'd writing to the stream we can just close it? (so return Ok(Async::Ready(()))
     fn circuit_to_socket(
         &mut self,
         stream: &mut CircuitStream,
     ) -> Result<Async<()>, Error> {
         match self.circuit.poll_stream_read(stream.stream_id)? {
-            toroxide::Async::Ready(data) => {
+            Async::Ready(data) => {
                 if data.len() == 0 {
                     return Ok(Async::Ready(()));
                 }
@@ -505,15 +532,15 @@ impl<'a> CircuitPiper<'a> {
                                 break;
                             }
                         }
-                        // TODO: differentiate not ready from other error
+                        // TODO: differentiate not ready from other error?
                         Err(e) => {
-                            println!("circuit_to_socket: {:?}", e);
-                            return Err(e);
+                            println!("circuit_to_socket: {:?} (socket closed? closing stream)", e);
+                            return Ok(Async::Ready(()));
                         }
                     }
                 }
             }
-            toroxide::Async::NotReady => {}
+            Async::NotReady => {}
         }
         Ok(Async::NotReady)
     }
@@ -538,6 +565,7 @@ impl<'a> CircuitPiper<'a> {
                 Err(_) => {},
             }
             for mut stream in streams.iter_mut() {
+                println!("polling stream {}", stream.stream_id);
                 match stream.state {
                     CircuitStreamState::Setup => {
                         let async = match self.circuit.poll_stream_setup(stream.stream_id) {
@@ -548,39 +576,33 @@ impl<'a> CircuitPiper<'a> {
                             }
                         };
                         match async {
-                            toroxide::Async::Ready(()) => stream.state = CircuitStreamState::Ready,
-                            toroxide::Async::NotReady => continue,
+                            Async::Ready(()) => stream.state = CircuitStreamState::Ready,
+                            Async::NotReady => continue,
                         }
                     }
                     CircuitStreamState::Ready => {
-                        if !stream.outbound_closed {
-                            match self.socket_to_circuit(&mut stream) {
-                                Ok(async) => match async {
-                                    Async::Ready(()) => stream.outbound_closed = true,
-                                    Async::NotReady => {}
-                                }
-                                Err(e) => {
-                                    println!("socket_to_circuit: {:?}", e);
-                                    return Err(e);
-                                    //stream.state = CircuitStreamState::Done;
-                                }
+                        match self.socket_to_circuit(&mut stream) {
+                            Ok(async) => match async {
+                                Async::Ready(()) => stream.state = CircuitStreamState::Done,
+                                Async::NotReady => {}
+                            }
+                            Err(e) => {
+                                println!("socket_to_circuit: {:?}", e);
+                                return Err(e);
                             }
                         }
-                        if !stream.inbound_closed {
+                        // So but what about half-open kinds of things?
+                        if stream.state != CircuitStreamState::Done {
                             match self.circuit_to_socket(&mut stream) {
                                 Ok(async) => match async {
-                                    Async::Ready(()) => stream.inbound_closed = true,
+                                    Async::Ready(()) => stream.state = CircuitStreamState::Done,
                                     Async::NotReady => {}
                                 }
                                 Err(e) => {
                                     println!("circuit_to_socket: {:?}", e);
                                     return Err(e);
-                                    //stream.state = CircuitStreamState::Done;
                                 }
                             }
-                        }
-                        if stream.inbound_closed && stream.outbound_closed {
-                            stream.state = CircuitStreamState::Done;
                         }
                     }
                     CircuitStreamState::Done => {}
@@ -592,6 +614,7 @@ impl<'a> CircuitPiper<'a> {
             if len_before != len_after {
                 println!("# of active streams: {}", len_after);
             }
+            thread::sleep(time::Duration::from_millis(10));
         }
     }
 }
