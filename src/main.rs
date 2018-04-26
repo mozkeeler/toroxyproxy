@@ -474,27 +474,70 @@ impl<'a> CircuitPiper<'a> {
         CircuitPiper { circuit, receiver }
     }
 
-    fn socket_to_circuit(
-        &mut self,
-        stream: &mut CircuitStream,
-    ) -> Result<Async<()>, Error> {
-        let mut buf = Vec::with_capacity(498);
-        buf.resize(498, 0);
-        match stream.stream.read(&mut buf) {
-            Ok(n) => {
-                if n == 0 {
-                    return Ok(Async::Ready(()));
+    // Read as much as possible from the socket (as in, until it would block).
+    fn read_from_socket(&mut self, stream: &mut CircuitStream) -> Result<Async<Vec<u8>>, Error> {
+        let mut total_buf = Vec::with_capacity(2048);
+        loop {
+            let mut buf = Vec::with_capacity(2048);
+            buf.resize(2048, 0);
+            match stream.stream.read(&mut buf) {
+                Ok(n) => {
+                    total_buf.extend_from_slice(&mut buf[..n]);
+                    if n == 0 {
+                        return Ok(Async::Ready(total_buf));
+                    }
                 }
-                // TODO polling here...?
-                self.circuit.poll_stream_write(stream.stream_id, &buf[..n])?;
+                Err(ref e) if e.kind() == ErrorKind::WouldBlock => {
+                    if total_buf.len() > 0 {
+                        return Ok(Async::Ready(total_buf));
+                    } else {
+                        return Ok(Async::NotReady);
+                    }
+                }
+                Err(e) => return Err(e),
             }
-            Err(ref e) if e.kind() == ErrorKind::WouldBlock => return Ok(Async::NotReady),
-            Err(e) => {
-                println!("socket_to_circuit: {:?} (socket closed? closing stream)", e);
-                return Ok(Async::Ready(()));
+        }
+    }
+
+    fn socket_to_circuit(&mut self, stream: &mut CircuitStream) -> Result<Async<()>, Error> {
+        let bytes = match self.read_from_socket(stream)? {
+            Async::Ready(bytes) => bytes,
+            Async::NotReady => return Ok(Async::NotReady),
+        };
+        if bytes.len() == 0 {
+            return Ok(Async::Ready(()));
+        }
+        for chunk in bytes[..].chunks(498) {
+            match self.circuit.poll_stream_write(stream.stream_id, chunk)? {
+                Async::Ready(()) => {},
+                Async::NotReady => {
+                    println!("probably have to poll write to circuit?");
+                }
             }
         }
         Ok(Async::NotReady)
+    }
+
+    // Read as much as possible from the circuit (as in, until it would block).
+    fn read_from_circuit(&mut self, stream: &mut CircuitStream) -> Result<Async<Vec<u8>>, Error> {
+        let mut total_buf = Vec::with_capacity(2048);
+        loop {
+            match self.circuit.poll_stream_read(stream.stream_id)? {
+                Async::Ready(mut data) => {
+                    if data.len() == 0 {
+                        return Ok(Async::Ready(total_buf));
+                    }
+                    total_buf.append(&mut data);
+                }
+                Async::NotReady => {
+                    if total_buf.len() > 0 {
+                        return Ok(Async::Ready(total_buf));
+                    } else {
+                        return Ok(Async::NotReady);
+                    }
+                }
+            }
+        }
     }
 
     // I guess the contract here is if we Err'd reading from the circuit we return an Err but if we
@@ -503,30 +546,29 @@ impl<'a> CircuitPiper<'a> {
         &mut self,
         stream: &mut CircuitStream,
     ) -> Result<Async<()>, Error> {
-        match self.circuit.poll_stream_read(stream.stream_id)? {
-            Async::Ready(data) => {
-                if data.len() == 0 {
-                    return Ok(Async::Ready(()));
-                }
-                // TODO polling here...?
-                let mut offset = 0;
-                loop {
-                    match stream.stream.write(&data[offset..]) {
-                        Ok(n) => {
-                            offset += n;
-                            if offset == data.len() {
-                                break;
-                            }
-                        }
-                        // TODO: differentiate not ready from other error?
-                        Err(e) => {
-                            println!("circuit_to_socket: {:?} (socket closed? closing stream)", e);
-                            return Ok(Async::Ready(()));
-                        }
+        let bytes = match self.read_from_circuit(stream)? {
+            Async::Ready(bytes) => bytes,
+            Async::NotReady => return Ok(Async::NotReady),
+        };
+        if bytes.len() == 0 {
+            return Ok(Async::Ready(()));
+        }
+        // TODO polling here...?
+        let mut offset = 0;
+        loop {
+            match stream.stream.write(&bytes[offset..]) {
+                Ok(n) => {
+                    offset += n;
+                    if offset == bytes.len() {
+                        break;
                     }
                 }
+                // TODO: differentiate not ready from other error?
+                Err(e) => {
+                    println!("circuit_to_socket: {:?} (socket closed? closing stream)", e);
+                    return Ok(Async::Ready(()));
+                }
             }
-            Async::NotReady => {}
         }
         Ok(Async::NotReady)
     }
