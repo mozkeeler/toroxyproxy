@@ -5,8 +5,8 @@ extern crate toroxide_openssl;
 use byteorder::{NetworkEndian, ReadBytesExt, WriteBytesExt};
 use std::io::{Error, ErrorKind, Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
-use std::{env, str, thread, time};
-use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TryRecvError};
+use std::{env, str, thread};
+use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 use toroxide::{Async, Circuit, IdTracker};
 use toroxide::dir::{PreTorPeer, TorPeer, TorPeerList};
 use toroxide_openssl::{PendingTlsOpensslImpl, RsaSignerOpensslImpl, RsaVerifierOpensslImpl,
@@ -36,9 +36,15 @@ fn do_proxy(dir_server: String) -> Result<(), Error> {
         match stream {
             Ok(stream) => match tx.send(stream) {
                 Ok(()) => {},
-                Err(e) => println!("error sending stream: {:?}", e),
+                Err(e) => {
+                    println!("error sending stream: {:?}", e);
+                    break;
+                }
             }
-            Err(e) => println!("error accepting connection: {:?}", e),
+            Err(e) => {
+                println!("error accepting connection: {:?}", e);
+                break;
+            }
         }
     }
     socks_thread_handle.join().map_err(|_| Error::new(ErrorKind::Other, "couldn't join thread?"))?;
@@ -55,6 +61,7 @@ fn socks_thread(dir_server: String, stream_rx: Receiver<TcpStream>) {
                 Ok(()) => {},
                 Err(e) => {
                     println!("socks4a_prelude failed: {:?}", e);
+                    break;
                 }
             }
             Err(e) => {
@@ -114,32 +121,21 @@ fn socks4a_prelude(mut stream: TcpStream, tx: &SyncSender<SocksPrelude>) -> Resu
     } // c'mon liveness detection :(
     stream.write_all(&mut outbuf)?;
     match tx.send((stream, domain, port)) {
-        Ok(()) => {},
+        Ok(()) => Ok(()),
         Err(e) => {
             println!("failed to send socks prelude: {:?}", e);
+            Err(Error::new(ErrorKind::Other, e))
         }
     }
-    Ok(())
 }
 
 fn pipe_thread(dir_server: String, mut socks_rx: Receiver<SocksPrelude>) {
-    /*
     let (tx, rx) : (SyncSender<OpensslCircuit>, Receiver<OpensslCircuit>) = sync_channel(0);
     let circuit_creation_thread_handle = thread::spawn(move || {
         circuit_creation_thread(dir_server, tx);
     });
     let mut num_circuits_received = 0;
-    */
-    let mut circ_id_tracker: IdTracker<u32> = IdTracker::new();
-    let peers = match get_peer_list(&dir_server) {
-        Ok(peers) => peers,
-        Err(e) => {
-            println!("get_peer_list failed: {:?}", e);
-            return;
-        }
-    };
     loop {
-        /*
         let circuit = match rx.recv() {
             Ok(circuit) => circuit,
             Err(e) => {
@@ -149,14 +145,6 @@ fn pipe_thread(dir_server: String, mut socks_rx: Receiver<SocksPrelude>) {
         };
         num_circuits_received += 1;
         println!("received {} total circuits", num_circuits_received);
-        */
-        let circuit = match create_circuit(&dir_server, &mut circ_id_tracker, &peers) {
-            Ok(circuit) => circuit,
-            Err(e) => {
-                println!("couldn't create new circuit: {:?}", e);
-                return;
-            }
-        };
         let mut piper = CircuitPiper::new(circuit, &mut socks_rx);
         loop {
             let async = match piper.poll() {
@@ -172,10 +160,9 @@ fn pipe_thread(dir_server: String, mut socks_rx: Receiver<SocksPrelude>) {
             }
         }
     }
-    //circuit_creation_thread_handle.join().unwrap();
+    circuit_creation_thread_handle.join().unwrap();
 }
 
-/*
 fn circuit_creation_thread(dir_server: String, circuit_tx: SyncSender<OpensslCircuit>) {
     let mut circ_id_tracker: IdTracker<u32> = IdTracker::new();
     let peers = match get_peer_list(&dir_server) {
@@ -206,7 +193,6 @@ fn circuit_creation_thread(dir_server: String, circuit_tx: SyncSender<OpensslCir
         }
     }
 }
-*/
 
 fn create_circuit(
     dir_server: &str,
@@ -565,7 +551,6 @@ impl<'a> CircuitPiper<'a> {
                 Err(_) => {},
             }
             for mut stream in streams.iter_mut() {
-                println!("polling stream {}", stream.stream_id);
                 match stream.state {
                     CircuitStreamState::Setup => {
                         let async = match self.circuit.poll_stream_setup(stream.stream_id) {
@@ -614,7 +599,6 @@ impl<'a> CircuitPiper<'a> {
             if len_before != len_after {
                 println!("# of active streams: {}", len_after);
             }
-            thread::sleep(time::Duration::from_millis(10));
         }
     }
 }
