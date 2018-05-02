@@ -5,7 +5,7 @@ extern crate toroxide_openssl;
 use byteorder::{NetworkEndian, ReadBytesExt, WriteBytesExt};
 use std::io::{Error, ErrorKind, Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
-use std::{env, str, thread};
+use std::{env, str, thread, time};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 use toroxide::{Async, Circuit, IdTracker};
 use toroxide::dir::{PreTorPeer, TorPeer, TorPeerList};
@@ -474,10 +474,13 @@ impl<'a> CircuitPiper<'a> {
         CircuitPiper { circuit, receiver }
     }
 
-    // Read as much as possible from the socket (as in, until it would block).
+    // Read about 1MB or until the circuit would block.
     fn read_from_socket(&mut self, stream: &mut CircuitStream) -> Result<Async<Vec<u8>>, Error> {
         let mut total_buf = Vec::with_capacity(2048);
         loop {
+            if total_buf.len() > 1048576 {
+                return Ok(Async::Ready(total_buf));
+            }
             let mut buf = Vec::with_capacity(2048);
             buf.resize(2048, 0);
             match stream.stream.read(&mut buf) {
@@ -518,10 +521,13 @@ impl<'a> CircuitPiper<'a> {
         Ok(Async::NotReady)
     }
 
-    // Read as much as possible from the circuit (as in, until it would block).
+    // Read about 10 data packets or until the circuit would block.
     fn read_from_circuit(&mut self, stream: &mut CircuitStream) -> Result<Async<Vec<u8>>, Error> {
         let mut total_buf = Vec::with_capacity(2048);
         loop {
+            if total_buf.len() >= 4980 {
+                return Ok(Async::Ready(total_buf));
+            }
             match self.circuit.poll_stream_read(stream.stream_id)? {
                 Async::Ready(mut data) => {
                     if data.len() == 0 {
@@ -579,6 +585,7 @@ impl<'a> CircuitPiper<'a> {
         // self.receiver, then do try_recv in the inner loop. Go back to the outer loop when
         // self.streams.len() == 0.
         loop {
+            let before = time::Instant::now();
             match self.receiver.try_recv() {
                 Ok((stream, domain, port)) => {
                     let hostport = format!("{}:{}", domain, port);
@@ -586,7 +593,7 @@ impl<'a> CircuitPiper<'a> {
                     if stream.set_nonblocking(true).is_ok() {
                         let stream_id = self.circuit.open_stream(&hostport);
                         streams.push(CircuitStream::new(stream, stream_id));
-                        println!("# of active streams: {}", streams.len());
+                        println!("new stream (total {})", streams.len());
                     }
                 }
                 // TODO: differentiate nothing there from disconnected
@@ -598,8 +605,11 @@ impl<'a> CircuitPiper<'a> {
                         let async = match self.circuit.poll_stream_setup(stream.stream_id) {
                             Ok(async) => async,
                             Err(e) => {
+                                // TODO: Error 3 is "connection refused", so we should relay this to
+                                // the client and not kill the whole circuit
                                 println!("CircuitPiper stream setup error: {:?}", e);
-                                return Err(e);
+                                stream.state = CircuitStreamState::Done;
+                                Async::NotReady
                             }
                         };
                         match async {
@@ -608,26 +618,25 @@ impl<'a> CircuitPiper<'a> {
                         }
                     }
                     CircuitStreamState::Ready => {
-                        match self.socket_to_circuit(&mut stream) {
+                        match self.circuit_to_socket(&mut stream) {
                             Ok(async) => match async {
                                 Async::Ready(()) => stream.state = CircuitStreamState::Done,
                                 Async::NotReady => {}
                             }
                             Err(e) => {
-                                println!("socket_to_circuit: {:?}", e);
-                                return Err(e);
+                                println!("circuit_to_socket: {:?}", e);
+                                stream.state = CircuitStreamState::Done;
                             }
                         }
-                        // So but what about half-open kinds of things?
                         if stream.state != CircuitStreamState::Done {
-                            match self.circuit_to_socket(&mut stream) {
+                            match self.socket_to_circuit(&mut stream) {
                                 Ok(async) => match async {
                                     Async::Ready(()) => stream.state = CircuitStreamState::Done,
                                     Async::NotReady => {}
                                 }
                                 Err(e) => {
-                                    println!("circuit_to_socket: {:?}", e);
-                                    return Err(e);
+                                    println!("socket_to_circuit: {:?}", e);
+                                    stream.state = CircuitStreamState::Done;
                                 }
                             }
                         }
@@ -639,7 +648,13 @@ impl<'a> CircuitPiper<'a> {
             streams.retain(|stream| stream.state != CircuitStreamState::Done);
             let len_after = streams.len();
             if len_before != len_after {
-                println!("# of active streams: {}", len_after);
+                println!("some streams done (total {} now)", len_after);
+            }
+            let after = time::Instant::now();
+            let elapsed = after.duration_since(before);
+            if  elapsed > time::Duration::from_millis(100) {
+                println!("took {} + {}s to loop", elapsed.as_secs(),
+                         elapsed.subsec_nanos() as f64 * 1e-9);
             }
         }
     }
